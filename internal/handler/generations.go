@@ -34,6 +34,13 @@ type GenerationsHandler struct {
 	// reference); NewRouterWithAdapters wraps the fixed registry in a closure
 	// so the injection path for tests is unchanged.
 	Adapters func() generation.Registry
+	// Refs 按请求取当前生效的公开域名，用来把参考图的对象键拼成上游能抓取的 URL。
+	// 与 Adapters 同一个 getter 约定：后台改完 R2 配置立刻生效。
+	//
+	// 这里只用到 PublicBase 而用不到 Store（生成流程不写对象），但仍然收整个
+	// ReferenceStore：拆开会让"存储与公开域名必须成对"这条约束（见该类型的注释）
+	// 在这里被悄悄绕过。
+	Refs func() ReferenceStore
 }
 
 type generateRequest struct {
@@ -41,6 +48,9 @@ type generateRequest struct {
 	Model       string `json:"model" binding:"required"`
 	AspectRatio string `json:"aspectRatio" binding:"required"`
 	IsPublic    bool   `json:"isPublic"`
+	// ReferenceKeys 是 POST /uploads/reference 返回的对象键，最多 8 个，**顺序有意义**。
+	// 空表示纯文生图。收键而不是 URL 的理由见 uploads.go 的类型注释。
+	ReferenceKeys []string `json:"referenceKeys"`
 }
 
 // Create 同步生成一张图。
@@ -87,16 +97,52 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// 参考图的三道校验。**全部在建行与扣费之前**：这几种失败都是"这次请求本来就
+	// 不该发生"，而不是"发生了但失败了"——建了行再拒等于在历史里留下一条用户没有
+	// 发起过的失败记录，扣了费再拒还要走一遍退款。
+	var refURLs []string
+	if len(req.ReferenceKeys) > 0 {
+		if !m.SupportsImageToImage {
+			// 这条守卫存在的意义是让 supports_image_to_image 这个标记**有效**。
+			// 不校验的话它就退化成一个纯装饰的字段：GET /models 对外声明某模型
+			// 不支持参考图，而后端照样把参考图发给它——上游要么忽略、要么 422，
+			// 两种都让用户白付一次钱。
+			c.JSON(http.StatusBadRequest, gin.H{
+				"code":    errCodeModelUnavailable,
+				"message": "该模型不支持参考图；请换一个支持图生图的模型，或移除参考图",
+			})
+			return
+		}
+		if err := parseReferenceKeys(req.ReferenceKeys, userID); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"code": errCodeBadRequest, "message": err.Error()})
+			return
+		}
+		// 拼不出公开 URL 就不能往下走：上游必须能抓到这些图。这种情况只会在
+		// "上传时 R2 是配好的、生成时被人在后台清空了"这种时序里出现，很罕见，
+		// 但静默把参考图丢掉去做纯文生图是更坏的结果——用户按图生图付了费。
+		refURLs = referenceURLs(req.ReferenceKeys, h.Refs().PublicBase)
+		for _, u := range refURLs {
+			if u == "" {
+				c.JSON(http.StatusServiceUnavailable, gin.H{
+					"code":    errCodeStorageUnavailable,
+					"message": "reference images require object storage",
+				})
+				return
+			}
+		}
+	}
+
 	gen := model.Generation{
-		ID:          uuid.NewString(),
-		UserID:      userID,
-		Model:       m.ID,
-		Prompt:      req.Prompt,
-		AspectRatio: req.AspectRatio,
-		Width:       width,
-		Height:      height,
-		Status:      model.GenStatusProcessing,
-		IsPublic:    req.IsPublic,
+		ID:            uuid.NewString(),
+		UserID:        userID,
+		Model:         m.ID,
+		Prompt:        req.Prompt,
+		AspectRatio:   req.AspectRatio,
+		Width:         width,
+		Height:        height,
+		Status:        model.GenStatusProcessing,
+		IsPublic:      req.IsPublic,
+		ReferenceKeys: encodeReferenceKeys(req.ReferenceKeys),
 	}
 	if err := h.DB.Create(&gen).Error; err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"code": errCodeInternal, "message": "internal error"})
@@ -133,6 +179,9 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 	started := time.Now()
 	res, genErr := adapter.Generate(upstreamCtx, generation.GenerateRequest{
 		Prompt: req.Prompt, Width: width, Height: height,
+		// 参考图按**原序**传下去：顺序对应上游的 input_image、input_image_2…，
+		// 而"第一张是主体、后面是风格参考"的语义来自用户在界面上的排列。
+		ReferenceImageURLs: refURLs,
 		// 上游模型名必须按行传：Registry 只按 provider 索引，adapter 实例是共享的。
 		// 焊死在实例上的话，表里第二行同 provider 的模型会被静默提交到前一行的上游
 		// 模型——用户按 pro 付费拿到 max 的结果，没有任何地方报错。
@@ -159,7 +208,7 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 		gen.CreditsSpent = 0
 		gen.DurationMs = elapsed
 		h.save(&gen)
-		c.JSON(http.StatusOK, toGenerationResponse(gen))
+		c.JSON(http.StatusOK, toGenerationResponse(gen, h.Refs().PublicBase))
 		return
 	}
 
@@ -171,7 +220,7 @@ func (h *GenerationsHandler) Create(c *gin.Context) {
 	gen.CreditsSpent = spent
 	gen.DurationMs = elapsed
 	h.save(&gen)
-	c.JSON(http.StatusOK, toGenerationResponse(gen))
+	c.JSON(http.StatusOK, toGenerationResponse(gen, h.Refs().PublicBase))
 }
 
 func (h *GenerationsHandler) markFailed(gen *model.Generation, reason string) {
@@ -191,7 +240,7 @@ func (h *GenerationsHandler) save(gen *model.Generation) {
 
 // toGenerationResponse 的字段名与前端 image-front 的 Generation 判别联合一一对应。
 // 改这里就要同步改 image-front/lib/generation-types.ts。
-func toGenerationResponse(g model.Generation) gin.H {
+func toGenerationResponse(g model.Generation, publicBase string) gin.H {
 	out := gin.H{
 		"id":           g.ID,
 		"model":        g.Model,
@@ -201,6 +250,15 @@ func toGenerationResponse(g model.Generation) gin.H {
 		"status":       g.Status,
 		"creditsSpent": g.CreditsSpent,
 		"createdAt":    g.CreatedAt.UTC().Format(time.RFC3339),
+	}
+	// 参考图。**这条响应只发给记录的属主**（两个调用点都在认证后、且按 user_id
+	// 过滤），所以这里透出没有隐私问题。
+	//
+	// ⚠️ 将来做公开画廊时**不要复用这个函数**：参考图是用户上传的原图，可能是他
+	// 自己的照片，公开展示需要在上传时就明确告知。画廊必须有自己的响应构造函数与
+	// 独立的测试（同理由见设计文档里对"匿名列表不能与鉴权列表共用过滤代码"的说明）。
+	if keys := decodeReferenceKeys(g.ReferenceKeys); len(keys) > 0 {
+		out["referenceImages"] = referenceURLs(keys, publicBase)
 	}
 	if g.Status == model.GenStatusSucceeded {
 		out["imageUrl"] = g.ImageURL

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"testing"
 	"time"
 
@@ -131,24 +132,41 @@ func TestListExcludesProcessing(t *testing.T) {
 }
 
 func TestListIncludesFailed(t *testing.T) {
-	// 失败记录**要**返回。用户看到"我明明生成过一张"却在历史里找不到，会怀疑是不是
-	// 被吞了钱；而失败记录恰恰能证明没扣钱（creditsSpent: 0）。
+	// 失败记录**默认不返回，但必须查得到**。
+	//
+	// 这条测试原先断言的是"默认就返回"。改成默认隐藏是一次产品取舍（失败的灰格子
+	// 在历史页上是噪音），但**它原来的理由一个字都没作废**：用户看到"我明明生成过
+	// 一张"却找不到，会怀疑是不是被吞了钱，而失败记录恰恰能证明没扣（creditsSpent: 0）。
+	// 所以这里改成钉住新契约的两端——默认看不到、开关一开就完整可见，
+	// 而**不是**把这条测试删掉。删掉的话，哪天有人把 includeFailed 这条路也去掉，
+	// 就没有任何东西拦得住了。
 	r, db := setupRouterWithDB(t)
-	token := registerAndLogin(t, r, "list-failed@example.com", "secret12345")
+	token := registerAndLogin(t, r, "list-failed-toggle@example.com", "secret12345")
 	var u model.User
-	db.Where("email = ?", "list-failed@example.com").First(&u)
+	db.Where("email = ?", "list-failed-toggle@example.com").First(&u)
 
 	insertGen(t, db, "failed-1", u.ID, time.Now().UTC(), model.GenStatusFailed)
 
+	// 默认：看不到。
 	rows, _ := decodeList(t, getList(r, token, ""))
+	if len(rows) != 0 {
+		t.Fatalf("默认不该返回失败记录，得到 %d 行", len(rows))
+	}
+
+	// 开关打开：完整可见，且**该带的字段一个不少**——error 说明为什么失败，
+	// creditsSpent=0 证明没扣钱，那两条正是用户翻出这条记录时要看的东西。
+	rows, _ = decodeList(t, getList(r, token, "?includeFailed=true"))
 	if len(rows) != 1 {
-		t.Fatalf("失败记录要返回，得到 %d 行", len(rows))
+		t.Fatalf("includeFailed=true 时失败记录要返回，得到 %d 行", len(rows))
 	}
 	if rows[0]["status"] != model.GenStatusFailed {
 		t.Errorf("status: got %v", rows[0]["status"])
 	}
 	if _, ok := rows[0]["error"]; !ok {
 		t.Error("失败记录要带 error 字段")
+	}
+	if got := rows[0]["creditsSpent"]; got != float64(0) {
+		t.Errorf("失败记录的 creditsSpent 必须是 0（那是「没扣钱」的凭据），得到 %v", got)
 	}
 }
 
@@ -391,5 +409,168 @@ func TestListPaginatesRowsWithGormAssignedTimestamps(t *testing.T) {
 			t.Fatalf("重复返回 %s: %v", id, seen)
 		}
 		uniq[id] = true
+	}
+}
+
+// TestListHidesFailedByDefault 历史列表默认不返回失败记录，但开关能翻出来。
+//
+// 默认隐藏是产品取舍（失败的灰格子是噪音）；**仍然查得到**是必需的——生成失败时
+// 用户第一反应是担心被扣钱，而那条记录上的"未扣次数"是唯一能打消疑虑的东西。
+func TestListHidesFailedByDefault(t *testing.T) {
+	r, db := setupRouterWithDB(t)
+	token := registerAndLogin(t, r, "list-failed@example.com", "secret12345")
+	uid := grantTo(t, db, "list-failed@example.com", 50*modelCredits(t, db, "flux-2-max"))
+
+	// 直接造行，不走生成——这里考察的是过滤，不是生成链路。
+	seed := []struct {
+		id     string
+		status string
+	}{
+		{"ok-1", model.GenStatusSucceeded},
+		{"bad-1", model.GenStatusFailed},
+		{"ok-2", model.GenStatusSucceeded},
+		{"bad-2", model.GenStatusFailed},
+		{"ok-3", model.GenStatusSucceeded},
+		{"proc-1", model.GenStatusProcessing},
+	}
+	for _, s := range seed {
+		row := model.Generation{
+			ID: s.id, UserID: uid, Model: "flux-2-max", Prompt: "p",
+			AspectRatio: "1:1", Width: 1024, Height: 1024, Status: s.status,
+		}
+		if err := db.Create(&row).Error; err != nil {
+			t.Fatalf("造行 %s: %v", s.id, err)
+		}
+	}
+
+	collect := func(query string) []string {
+		t.Helper()
+		var ids []string
+		cursor := ""
+		for range 10 { // 上限防死循环
+			q := "?" + query
+			if cursor != "" {
+				q += "&cursor=" + cursor
+			}
+			w := getList(r, token, q)
+			if w.Code != http.StatusOK {
+				t.Fatalf("列表 %q: %d %s", q, w.Code, w.Body.String())
+			}
+			var body struct {
+				Generations []struct {
+					ID string `json:"id"`
+				} `json:"generations"`
+				NextCursor *string `json:"nextCursor"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+				t.Fatalf("解析: %v", err)
+			}
+			for _, g := range body.Generations {
+				ids = append(ids, g.ID)
+			}
+			if body.NextCursor == nil {
+				break
+			}
+			cursor = *body.NextCursor
+		}
+		return ids
+	}
+
+	// 默认：只有成功的三条，processing 与 failed 都不在。
+	got := collect("limit=2")
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"ok-1", "ok-2", "ok-3"}) {
+		t.Errorf("默认应当只返回成功的三条，得到 %v", got)
+	}
+
+	// 开关打开：成功 + 失败共五条，processing 仍然不在（它永远不该露出来）。
+	got = collect("limit=2&includeFailed=true")
+	slices.Sort(got)
+	if !slices.Equal(got, []string{"bad-1", "bad-2", "ok-1", "ok-2", "ok-3"}) {
+		t.Errorf("includeFailed=true 应当返回五条（不含 processing），得到 %v", got)
+	}
+
+	// **只认字面量 "true"。** 宽松解析会让一个拼错的查询串悄悄打开开关，
+	// 而"莫名多出一堆失败记录"看起来像系统坏了。
+	for _, v := range []string{"1", "yes", "on", "TRUE", "false", ""} {
+		got = collect("limit=50&includeFailed=" + v)
+		slices.Sort(got)
+		if !slices.Equal(got, []string{"ok-1", "ok-2", "ok-3"}) {
+			t.Errorf("includeFailed=%q 应当按 false 处理，得到 %v", v, got)
+		}
+	}
+}
+
+// TestListPaginationStaysCorrectUnderFilter 过滤之后游标翻页仍然不重不漏。
+//
+// 过滤放在 WHERE 里，所以 Limit(limit+1) 判下一页与排序键都不受影响——但这条
+// 必须真的翻一遍才算数：一个"取完再在内存里筛掉 failed"的实现会让每页数量忽多忽少，
+// 甚至出现"有 nextCursor 但下一页是空的"。
+func TestListPaginationStaysCorrectUnderFilter(t *testing.T) {
+	r, db := setupRouterWithDB(t)
+	token := registerAndLogin(t, r, "list-pagefilter@example.com", "secret12345")
+	uid := grantTo(t, db, "list-pagefilter@example.com", 50*modelCredits(t, db, "flux-2-max"))
+
+	// 交替造 成功/失败，让每一页都可能被过滤打断。
+	for i := range 10 {
+		status := model.GenStatusSucceeded
+		if i%2 == 1 {
+			status = model.GenStatusFailed
+		}
+		row := model.Generation{
+			ID: fmt.Sprintf("g-%02d", i), UserID: uid, Model: "flux-2-max", Prompt: "p",
+			AspectRatio: "1:1", Width: 1024, Height: 1024, Status: status,
+		}
+		if err := db.Create(&row).Error; err != nil {
+			t.Fatalf("造行: %v", err)
+		}
+	}
+
+	seen := map[string]int{}
+	cursor := ""
+	pages := 0
+	for {
+		q := "?limit=2"
+		if cursor != "" {
+			q += "&cursor=" + cursor
+		}
+		w := getList(r, token, q)
+		var body struct {
+			Generations []struct {
+				ID     string `json:"id"`
+				Status string `json:"status"`
+			} `json:"generations"`
+			NextCursor *string `json:"nextCursor"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatalf("解析: %v", err)
+		}
+		pages++
+		if pages > 20 {
+			t.Fatal("翻页没有终止——nextCursor 一直非空")
+		}
+		for _, g := range body.Generations {
+			if g.Status == model.GenStatusFailed {
+				t.Errorf("默认过滤下不该出现失败记录 %s", g.ID)
+			}
+			seen[g.ID]++
+		}
+		if body.NextCursor == nil {
+			break
+		}
+		// **有 nextCursor 就必须真的还有下一页。** 内存里筛的实现会在这里返回空页。
+		if len(body.Generations) == 0 {
+			t.Fatal("返回了 nextCursor 却是空页——过滤没有做在 WHERE 里？")
+		}
+		cursor = *body.NextCursor
+	}
+
+	if len(seen) != 5 {
+		t.Errorf("应当翻到 5 条成功记录，得到 %d 条：%v", len(seen), seen)
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Errorf("%s 出现了 %d 次，翻页重复了", id, n)
+		}
 	}
 }

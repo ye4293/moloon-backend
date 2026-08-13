@@ -180,10 +180,11 @@ func (h *AdminModelsHandler) Create(c *gin.Context) {
 // generations 行仍按 id 引用它，事后对账会把两批结果混成一个模型的。要换上游就
 // 新建一行、把旧行下架。
 type patchModelRequest struct {
-	DisplayName *string `json:"displayName"`
-	Credits     *int    `json:"credits"`
-	Enabled     *bool   `json:"enabled"`
-	SortOrder   *int    `json:"sortOrder"`
+	DisplayName          *string `json:"displayName"`
+	Credits              *int    `json:"credits"`
+	Enabled              *bool   `json:"enabled"`
+	SortOrder            *int    `json:"sortOrder"`
+	SupportsImageToImage *bool   `json:"supportsImageToImage"`
 }
 
 func (h *AdminModelsHandler) Patch(c *gin.Context) {
@@ -230,6 +231,9 @@ func (h *AdminModelsHandler) Patch(c *gin.Context) {
 	}
 	if req.SortOrder != nil {
 		updates["sort_order"] = *req.SortOrder
+	}
+	if req.SupportsImageToImage != nil {
+		updates["supports_image_to_image"] = *req.SupportsImageToImage
 	}
 	if len(updates) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"code": errCodeBadRequest, "message": "没有可修改的字段"})

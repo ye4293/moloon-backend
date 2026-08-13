@@ -74,6 +74,21 @@ func (h *GenerationsHandler) List(c *gin.Context) {
 	// 让用户看到一个永远转圈的格子。
 	q := h.DB.Where("user_id = ? AND status <> ?", userID, model.GenStatusProcessing)
 
+	// **默认也不返回 failed。** 历史页是用来看自己出过什么图的，失败的灰格子混在
+	// 里面是噪音。但它们**必须仍然查得到**——生成失败时用户第一反应是担心被扣钱，
+	// 而那条记录上的"未扣次数"正是唯一能打消这个疑虑的东西（见前端 history-card
+	// 的注释）。所以是默认隐藏 + 一个开关，不是彻底删掉。
+	//
+	// 过滤放在 WHERE 里而不是让前端筛：客户端过滤会出现"点了加载更多但一条没多"
+	// （整页都是 failed 时），而空态判定还要和游标打架。
+	//
+	// **只认字面量 "true"**。`includeFailed=1` / `=yes` / `=on` 一律当 false ——
+	// 宽松解析会让一个随手拼错的查询串悄悄打开它，而"悄悄多出一堆失败记录"看起来
+	// 像是系统出了问题。
+	if c.Query("includeFailed") != "true" {
+		q = q.Where("status <> ?", model.GenStatusFailed)
+	}
+
 	if raw := c.Query("cursor"); raw != "" {
 		ts, id, err := decodeCursor(raw)
 		if err != nil {
@@ -112,9 +127,13 @@ func (h *GenerationsHandler) List(c *gin.Context) {
 		next = encodeCursor(rows[len(rows)-1])
 	}
 
+	// 参考图 URL 由键加当前配置的公开域名拼出来（见 model.Generation.ReferenceKeys
+	// 为什么存键不存 URL）。取一次，整页复用。
+	publicBase := h.Refs().PublicBase
+
 	out := make([]gin.H, 0, len(rows))
 	for _, g := range rows {
-		out = append(out, toGenerationResponse(g))
+		out = append(out, toGenerationResponse(g, publicBase))
 	}
 	c.JSON(http.StatusOK, gin.H{"generations": out, "nextCursor": next})
 }

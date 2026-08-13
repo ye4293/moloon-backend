@@ -120,6 +120,18 @@ func Open(databaseURL string) (*gorm.DB, error) {
 //
 // 用 FirstOrCreate 而不是 Save：Credits 等字段是**运营可改**的（后台调价），
 // 每次启动覆盖回默认值会把线上调整悄悄抹掉。
+//
+// **但 SupportsImageToImage 是例外，它每次启动强制同步。** 判据正是上面那条的
+// 反面：Credits 是一个**运营决策**（这个模型收多少钱由你定），而"支不支持参考图"
+// 是**上游 API 决定的能力事实**——运营改不了它，改了只会让声明与现实不符。
+// 两个方向都坏：关着的话用户明明能用的功能被挡住；开着而上游其实不支持的话，
+// 请求会被上游拒绝，而次数已经扣了。
+//
+// 让它归代码所有还顺带解决一个部署问题：既有生产库里这一行是 false（本功能上线
+// 前的值），而 FirstOrCreate **不会更新已存在的行**——不强制同步的话，新功能发上去
+// 之后没有任何人能用，且从界面上看不出原因。
+//
+// 出问题时的应急杠杆是 Enabled（把整个模型下架），那个才是运营该有的开关。
 func seedModels(db *gorm.DB) error {
 	flux := model.ImageModel{
 		ID:                   "flux-2-max",
@@ -127,11 +139,17 @@ func seedModels(db *gorm.DB) error {
 		Provider:             "flux",
 		UpstreamModel:        "flux-2-max",
 		Credits:              7,
-		SupportsImageToImage: false,
+		SupportsImageToImage: true,
 		Enabled:              true,
 		SortOrder:            10,
 	}
-	return db.Where(model.ImageModel{ID: flux.ID}).FirstOrCreate(&flux).Error
+	if err := db.Where(model.ImageModel{ID: flux.ID}).FirstOrCreate(&flux).Error; err != nil {
+		return err
+	}
+	// 只同步能力标记这一列，其余运营可改的字段一律不动。
+	return db.Model(&model.ImageModel{}).
+		Where("id = ?", flux.ID).
+		Update("supports_image_to_image", true).Error
 }
 
 // seedPlans 幂等地播种三个档位。

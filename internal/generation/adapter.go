@@ -48,6 +48,23 @@ type GenerateRequest struct {
 	// key 由它确定性推导，generations 表才不需要额外存一列 storage_key（两份
 	// 可能不一致的真相）。
 	GenerationID string
+
+	// ReferenceImageURLs 用户上传的参考图，按顺序传给上游做图生图 / 编辑。
+	// 空表示纯文生图。
+	//
+	// **顺序有意义**：上游把它们映射成 input_image、input_image_2… 这类带序号的
+	// 字段，而"第一张是主体、后面几张是风格参考"这种语义由用户在界面上的排列决定。
+	// 任何一层做排序或去重都会悄悄改变生成结果，而用户看不出为什么。
+	//
+	// 这同样不是 §3 拒绝的"provider 专属字段"——"用户提供的参考图"是**我们的**
+	// 领域概念（产品需求就是它），与 Prompt / Width / Height 同级；各家 API 怎么
+	// 表达它（BFL 是 input_image_N，别家可能是数组或 multipart）留在各自 adapter 里。
+	// 判据与 §3 一致：这里放"用户想要什么"，adapter 里放"某一家怎么表达它"。
+	//
+	// **传 URL 而不是键或字节。** 键需要拼公开域名，那要求 adapter 认识对象存储的
+	// 配置——而 adapter 的职责里没有存储。字节则会让请求体在内存里多背几 MB，
+	// 且上游本来就要求 URI（实测裸 base64 会被拒）。拼 URL 的活留在 handler。
+	ReferenceImageURLs []string
 }
 
 type GenerateResult struct {

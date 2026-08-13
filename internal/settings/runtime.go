@@ -31,9 +31,19 @@ type Snapshot struct {
 	// Validate 已在写入时拦过非法值，走到这里的坏值只可能来自手工改库。
 	SignupBonusCredits int
 
-	// adapters 与 storage 是按上面的值构造好的客户端，随快照一起替换。
+	// adapters 与 store 是按上面的值构造好的客户端，随快照一起替换。
 	adapters generation.Registry
+	// store 单独留一份，而不是只藏在 adapters 里面的 StoringAdapter 中：参考图上传
+	// 需要直接往对象存储写（它不经过任何 adapter）。
+	store storage.Storage
 }
+
+// Storage 当前生效的对象存储。
+//
+// **必须和 R2PublicBaseURL 从同一个 *Snapshot 上取。** 分两次 rt.snap.Load() 会在
+// 热重载的瞬间取到不匹配的一对——用新的 store 写对象、用旧的域名拼 URL，
+// 结果是一个 404 的永久链接，而没有任何地方报错。
+func (s *Snapshot) Storage() storage.Storage { return s.store }
 
 // StorageEnabled 五项齐全才算配置好（与 config.StorageEnabled 同一判断）。
 func (s *Snapshot) StorageEnabled() bool {
@@ -76,7 +86,10 @@ func (rt *Runtime) Reload() error {
 		AppBaseURL:        vals["appBaseUrl"],
 	}
 	s.SignupBonusCredits = parseBonus(vals["signupBonusCredits"])
-	s.adapters = buildAdapters(s)
+	// store 先建、再交给 buildAdapters 复用同一个实例：两次 buildStorage 会在没配
+	// R2 时打两条一样的告警，而更实际的问题是它们各自持有一份 S3 客户端与连接池。
+	s.store = buildStorage(s)
+	s.adapters = buildAdapters(s, s.store)
 	rt.snap.Store(s)
 	return nil
 }
@@ -96,9 +109,13 @@ func (rt *Runtime) SignupBonusCredits() int { return rt.snap.Load().SignupBonusC
 //
 // 每个 adapter 都被 StoringAdapter 包一层：新增 provider 自动获得转存，不依赖
 // 谁记得加代码。
-func buildAdapters(s *Snapshot) generation.Registry {
+//
+// store 由调用方传入而不是自己 buildStorage：快照要单独留一份 storage 给参考图上传
+// 用（它不经过任何 adapter），两处各建一次会让没配 R2 时打两条重复告警，
+// 更实际的问题是各自持有一份 S3 客户端与连接池。
+func buildAdapters(s *Snapshot, store storage.Storage) generation.Registry {
 	return generation.Registry{
-		"flux": generation.NewStoringAdapter(buildFlux(s), buildStorage(s)),
+		"flux": generation.NewStoringAdapter(buildFlux(s), store),
 	}
 }
 

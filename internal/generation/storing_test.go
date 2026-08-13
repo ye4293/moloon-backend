@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -205,7 +206,7 @@ func TestStoringAdapterRejectsNonImageContent(t *testing.T) {
 func TestStoringAdapterRejectsOversizedImage(t *testing.T) {
 	// 无上限地下载进内存是内存耗尽向量：并发几十个请求 + 上游返回一个巨大的
 	// 响应，就能把服务打死。
-	big := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, maxImageBytes+1)...)
+	big := append([]byte("\x89PNG\r\n\x1a\n"), make([]byte, storage.MaxImageBytes+1)...)
 	srv := serveBytes(t, "image/png", big)
 	inner := &fakeInner{url: srv.URL + "/big.png"}
 	store := &fakeStore{}
@@ -251,11 +252,16 @@ func TestStoringAdapterPassesRequestThrough(t *testing.T) {
 	req := GenerateRequest{
 		Prompt: "cat", Width: 1344, Height: 768,
 		UpstreamModel: "flux-pro-1.1", GenerationID: "gen-9",
+		// 参考图一并纳入：它的**顺序**对应上游的 input_image、input_image_2…，
+		// 装饰器若做了排序或去重，生成结果会变而用户看不出为什么。
+		ReferenceImageURLs: []string{"https://img.example.com/ref/1/a.jpg", "https://img.example.com/ref/1/b.jpg"},
 	}
 	if _, err := a.Generate(context.Background(), req); err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
-	if inner.lastReq != req {
+	// 用 DeepEqual 而不是 !=：GenerateRequest 含切片，不可比较。顺带它也真的
+	// 逐个比较了参考图 URL，而 != 只会比较切片头。
+	if !reflect.DeepEqual(inner.lastReq, req) {
 		t.Errorf("请求被改写了: got %+v, want %+v", inner.lastReq, req)
 	}
 }

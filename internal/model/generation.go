@@ -43,4 +43,19 @@ type Generation struct {
 	DurationMs   int64     `gorm:"not null;default:0"`
 	CreatedAt    time.Time `gorm:"index:idx_gen_user_created,priority:2"`
 	UpdatedAt    time.Time
+
+	// ReferenceKeys 这次生成用到的参考图（图生图 / 编辑的输入），JSON 数组字符串。
+	// 空串表示纯文生图。
+	//
+	// **存对象键，不存 URL。** 键是 `ref/<userID>/<uuid>.<ext>`，URL 由它加上当前
+	// 配置里的公开域名拼出来（storage.PublicURL）。存 URL 的话，哪天换了 R2 公开
+	// 域名，所有历史记录会一起变成死链且无法批量修复——而域名是后台可改的一项。
+	// 这与 Stored 那条"key 从 ID 确定性推导，不再存一份"是同一个取舍方向：
+	// 让可推导的东西保持可推导。
+	//
+	// 存 JSON 数组而不是开一张关联表：这些键只会被整体读写、从不单独查询，
+	// 一张只有 (generation_id, key, ordinal) 的表除了让每次读历史多一次 join
+	// 之外不提供任何东西。**顺序有意义**（对应上游的 input_image、input_image_2…），
+	// JSON 数组天然保序，而关联表还得自己维护一列 ordinal。
+	ReferenceKeys string `gorm:"type:text"`
 }

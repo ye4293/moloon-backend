@@ -26,11 +26,23 @@ type RouterOption func(*routerDeps)
 
 type routerDeps struct {
 	subs billing.SubscriptionFetcher
+	// refs 非 nil 时替换参考图上传用的存储。
+	refs *handler.ReferenceStore
 }
 
 // WithSubscriptionFetcher 替换 webhook 拉取订阅的实现（测试注入假实现用）。
 func WithSubscriptionFetcher(f billing.SubscriptionFetcher) RouterOption {
 	return func(d *routerDeps) { d.subs = f }
+}
+
+// WithReferenceStore 替换参考图上传用的存储（测试注入假 R2 用）。
+//
+// 需要它是因为真实的 R2 路径无法在测试里走通，而"上传接口"最要紧的几条不变量
+// （拒绝非图片时**没有写入**、扩展名取自嗅探而非声明值）恰恰只能通过观察存储
+// 收到了什么来断言。同 storage/r2_test.go 用 httptest.Server 假扮 R2 的思路，
+// 只是这里连 HTTP 那一层也不需要。
+func WithReferenceStore(refs handler.ReferenceStore) RouterOption {
+	return func(d *routerDeps) { d.refs = &refs }
 }
 
 // NewRouter 用**自建**的 settings.Store / Runtime 组装一个完整路由。
@@ -58,7 +70,7 @@ func NewRouter(db *gorm.DB, cfg *config.Config, opts ...RouterOption) *gin.Engin
 		// Store.All() 在空库上不会失败，走到这里说明库真的读不了。
 		panic(fmt.Sprintf("server.NewRouter: 初始化 settings.Runtime 失败: %v", err))
 	}
-	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), rt.SignupBonusCredits, opts...)
+	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), rt.SignupBonusCredits, runtimeRefStore(rt), opts...)
 }
 
 // NewRouterWithAdapters 让调用方自己提供 Registry。
@@ -72,7 +84,7 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 	//
 	// 这条路径**不注册**后台设置接口：它服务的是"自带 adapter 的隔离测试"，
 	// 那些测试不需要设置页，也没有 Store 可给。
-	return newRouterFull(db, cfg, func() generation.Registry { return adapters }, nil, cfg.AppBaseURL, nil, opts...)
+	return newRouterFull(db, cfg, func() generation.Registry { return adapters }, nil, cfg.AppBaseURL, nil, configRefStore(cfg), opts...)
 }
 
 // NewRouterWithRuntime 是 cmd/server/main.go 用的**生产入口**。
@@ -81,7 +93,7 @@ func NewRouterWithAdapters(db *gorm.DB, cfg *config.Config, adapters generation.
 // ValidateProviders。同时收 Store 与 Runtime 是为了不必把 Runtime.store
 // 这个私有字段暴露出去、也不必为它加一个 Store() getter。
 func NewRouterWithRuntime(db *gorm.DB, cfg *config.Config, st *settings.Store, rt *settings.Runtime, opts ...RouterOption) *gin.Engine {
-	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), rt.SignupBonusCredits, opts...)
+	return newRouterFull(db, cfg, rt.Adapters, &handler.AdminSettingsHandler{Store: st, Runtime: rt}, rt.AppBaseURL(), rt.SignupBonusCredits, runtimeRefStore(rt), opts...)
 }
 
 // newRouterFull 是所有路由注册的唯一实现处，三个公开入口都汇聚到这里。
@@ -97,6 +109,9 @@ func newRouterFull(
 	// getSignupBonus 按请求返回当前生效的注册赠送次数，nil 表示不赠送。
 	// 与 getAdapters 同一个约定：做成 getter 而非取值，后台改完立刻生效。
 	getSignupBonus func() int,
+	// getRefStore 按请求返回参考图上传用的存储与公开域名。同上的 getter 约定。
+	// **存储与公开域名必须成对返回**，理由见 handler.ReferenceStore 的注释。
+	getRefStore func() handler.ReferenceStore,
 	opts ...RouterOption,
 ) *gin.Engine {
 	r := gin.Default()
@@ -206,9 +221,31 @@ func newRouterFull(
 	authed := api.Group("", middleware.Auth(cfg.JWTSecret), middleware.RequireActiveUser(db))
 	authed.GET("/me", meHandler.Get)
 
-	generationsHandler := &handler.GenerationsHandler{DB: db, Adapters: getAdapters}
+	// 参考图用的存储与公开域名。测试可以用 WithReferenceStore 换成假的。
+	// 生成与上传两个 handler **必须共用同一个 refStore**：一个用它写对象、另一个
+	// 用它把键拼回 URL，两边取到不同的配置会写进去一个地址、读出来另一个。
+	refStore := getRefStore
+	if deps.refs != nil {
+		refs := *deps.refs
+		refStore = func() handler.ReferenceStore { return refs }
+	}
+
+	generationsHandler := &handler.GenerationsHandler{DB: db, Adapters: getAdapters, Refs: refStore}
 	authed.POST("/generations", generationsHandler.Create)
 	authed.GET("/generations", generationsHandler.List)
+
+	// 参考图上传单独叠一层 JSONOnly。
+	//
+	// **这一条是必需的，不是洁癖。** 它是全站唯一接收用户提供的**文件内容**的入口，
+	// 而如果它收 multipart，跨域页面就能直接打它：multipart/form-data 与 text/plain
+	// 一样属于 CORS **简单请求**类型、**不触发预检**（见 middleware/jsononly.go 的
+	// 完整论证）。收 application/json 并挂上 JSONOnly 之后，跨域请求必须先过预检，
+	// 而预检会被 CORS 白名单拦下。
+	//
+	// authed 组整体不挂 JSONOnly（那会一次性改变所有已认证接口的契约），所以这里
+	// 按路由挂——`authed.POST(path, mw, handler)` 只影响这一条。
+	uploadsHandler := &handler.UploadsHandler{Refs: refStore}
+	authed.POST("/uploads/reference", middleware.JSONOnly(), uploadsHandler.Create)
 
 	billingHandler := &handler.BillingHandler{DB: db, Billing: billingClient}
 	authed.POST("/billing/subscribe", billingHandler.Subscribe)
@@ -263,6 +300,26 @@ func BuildAdapters(cfg *config.Config) generation.Registry {
 	store := buildStorage(cfg)
 	return generation.Registry{
 		"flux": generation.NewStoringAdapter(buildFluxAdapter(cfg), store),
+	}
+}
+
+// runtimeRefStore 生产路径的参考图存储 getter（配置来自后台设置）。
+//
+// **一次 rt.Snapshot() 取齐两样东西。** 写成 rt.Storage() + rt.Snapshot().R2PublicBaseURL
+// 会有两次 atomic Load，中间若发生热重载就拿到不匹配的一对——用新的存储写对象、
+// 用旧的域名拼 URL，结果是一个 404 的永久链接，而没有任何地方报错。
+func runtimeRefStore(rt *settings.Runtime) func() handler.ReferenceStore {
+	return func() handler.ReferenceStore {
+		s := rt.Snapshot()
+		return handler.ReferenceStore{Store: s.Storage(), PublicBase: s.R2PublicBaseURL}
+	}
+}
+
+// configRefStore 从 env 取的版本，供 NewRouterWithAdapters 这条测试路径用。
+func configRefStore(cfg *config.Config) func() handler.ReferenceStore {
+	store := buildStorage(cfg)
+	return func() handler.ReferenceStore {
+		return handler.ReferenceStore{Store: store, PublicBase: cfg.R2PublicBaseURL}
 	}
 }
 

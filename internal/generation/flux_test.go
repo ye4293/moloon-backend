@@ -443,3 +443,131 @@ func TestFluxPollingTimeoutIsWrappedAsUpstream(t *testing.T) {
 		t.Fatalf("包装后原错误仍应可判定: %v", err)
 	}
 }
+
+// TestFluxMapsReferenceImagesToNumberedFields 参考图到 input_image / input_image_2…
+// 的映射。
+//
+// **第一张的字段名没有 `_1`。** 循环写成 `input_image_%d` 从 1 开始会得到
+// `input_image_1`——那是上游不认识的字段，而多数网关对未知字段的处置是**静默忽略**，
+// 于是表现成『第一张参考图不起作用』，没有任何错误信息。这条断言存在的全部理由
+// 就是钉住这个编号起点。
+func TestFluxMapsReferenceImagesToNumberedFields(t *testing.T) {
+	var gotBody map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		_, _ = w.Write([]byte(`{"id":"x","polling_url":"https://cdn.example/a.png","status":"Ready"}`))
+	}))
+	defer srv.Close()
+
+	urls := []string{
+		"https://img.example.com/ref/1/a.jpg",
+		"https://img.example.com/ref/1/b.jpg",
+		"https://img.example.com/ref/1/c.jpg",
+	}
+	a := newTestFluxAdapter(srv.URL, "k")
+	if _, err := a.Generate(context.Background(), GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+		ReferenceImageURLs: urls,
+	}); err != nil {
+		t.Fatalf("generate: %v", err)
+	}
+
+	// 第一张是裸的 input_image，第二三张才带序号，且序号从 2 起。
+	for field, want := range map[string]string{
+		"input_image":   urls[0],
+		"input_image_2": urls[1],
+		"input_image_3": urls[2],
+	} {
+		got, ok := gotBody[field]
+		if !ok {
+			t.Errorf("请求体缺少 %s。若你把循环写成从 1 开始，第一张会变成上游不认识的 "+
+				"input_image_1，而网关会静默忽略它——表现是『第一张参考图不起作用』", field)
+			continue
+		}
+		if got != want {
+			t.Errorf("%s = %v，想要 %v", field, got, want)
+		}
+	}
+	// **绝不能出现 input_image_1。**
+	if _, bad := gotBody["input_image_1"]; bad {
+		t.Errorf("请求体里出现了 input_image_1——上游没有这个字段，第一张图会被静默丢弃: %+v", gotBody)
+	}
+	// 也不能凭空多出没传的槽位。
+	if _, bad := gotBody["input_image_4"]; bad {
+		t.Errorf("只传了 3 张却出现了 input_image_4: %+v", gotBody)
+	}
+}
+
+// TestFluxOmitsReferenceFieldsWhenNone 没有参考图时，一个 input_image* 键都不能有。
+//
+// 塞 `"input_image": ""` 会被上游按 uri 格式校验拒掉（实测错误是
+// `Does not match format 'uri'`），于是**所有纯文生图请求突然全挂**——而这个改动
+// 本来只该影响图生图。这条守的是"新功能不能压垮旧功能"。
+func TestFluxOmitsReferenceFieldsWhenNone(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		urls []string
+	}{
+		{"nil", nil},
+		{"空切片", []string{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotBody map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				raw, _ := io.ReadAll(r.Body)
+				_ = json.Unmarshal(raw, &gotBody)
+				_, _ = w.Write([]byte(`{"id":"x","polling_url":"https://cdn.example/a.png","status":"Ready"}`))
+			}))
+			defer srv.Close()
+
+			a := newTestFluxAdapter(srv.URL, "k")
+			if _, err := a.Generate(context.Background(), GenerateRequest{
+				Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+				ReferenceImageURLs: tc.urls,
+			}); err != nil {
+				t.Fatalf("generate: %v", err)
+			}
+			for k := range gotBody {
+				if strings.HasPrefix(k, "input_image") {
+					t.Errorf("没有参考图时不该出现 %s（空串会被上游按 uri 校验拒掉，"+
+						"于是所有纯文生图请求一起挂）: %+v", k, gotBody)
+				}
+			}
+		})
+	}
+}
+
+// TestFluxRejectsTooManyReferenceImagesBeforeSending 超过上游上限时**不发请求**。
+//
+// handler 已经拦过一道（那一道给用户一条说得清的 400），这一道是最后一道：
+// 走到这里说明 handler 那道漏了，而此时**次数已经扣了**。发出去只会换回一个
+// 笼统的 422，然后走退款——不如在发之前就失败，少一次上游往返。
+func TestFluxRejectsTooManyReferenceImagesBeforeSending(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"id":"x","polling_url":"https://cdn.example/a.png","status":"Ready"}`))
+	}))
+	defer srv.Close()
+
+	urls := make([]string, maxFluxReferenceImages+1)
+	for i := range urls {
+		urls[i] = "https://img.example.com/ref/1/x.jpg"
+	}
+	a := newTestFluxAdapter(srv.URL, "k")
+	_, err := a.Generate(context.Background(), GenerateRequest{
+		Prompt: "p", Width: 1, Height: 1, UpstreamModel: "flux-2-max",
+		ReferenceImageURLs: urls,
+	})
+	if err == nil {
+		t.Fatal("超过上限应当报错")
+	}
+	// 必须包 ErrUpstream：调用方靠它决定要不要退款。
+	if !errors.Is(err, ErrUpstream) {
+		t.Errorf("错误必须包 ErrUpstream（调用方靠它判断退款），得到 %v", err)
+	}
+	if calls != 0 {
+		t.Errorf("超限时不该发请求，发了 %d 次", calls)
+	}
+}

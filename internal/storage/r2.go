@@ -53,10 +53,8 @@ func NewR2Storage(endpoint, accessKeyID, secretAccessKey, bucket, publicBaseURL 
 }
 
 func (s *R2Storage) Put(ctx context.Context, key, contentType string, body []byte) (string, error) {
-	// 去掉开头斜杠，理由与 publicBase 去掉末尾斜杠相同：两边各多一个斜杠就会拼出
-	// //，有些 CDN 对此 404，而这个 URL 是要永久存进库里的。归一化后再用于
-	// PutObject，避免对象键与 URL 各说一套。
-	key = strings.TrimPrefix(key, "/")
+	// 归一化后再用于 PutObject，避免对象键与 URL 各说一套（理由见 NormalizeKey）。
+	key = NormalizeKey(key)
 	_, err := s.client.PutObject(ctx, &s3.PutObjectInput{
 		Bucket:      aws.String(s.bucket),
 		Key:         aws.String(key),
@@ -69,5 +67,5 @@ func (s *R2Storage) Put(ctx context.Context, key, contentType string, body []byt
 	if err != nil {
 		return "", fmt.Errorf("上传对象 %s: %w", key, err)
 	}
-	return s.publicBase + "/" + key, nil
+	return PublicURL(s.publicBase, key), nil
 }

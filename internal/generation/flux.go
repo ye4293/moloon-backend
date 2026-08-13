@@ -109,6 +109,43 @@ func fluxIsTerminalFailure(status string) bool {
 	return false
 }
 
+// maxFluxReferenceImages 上游接受的参考图数量上限。
+//
+// BFL 的 Flux2Inputs schema 只开到 input_image_8（宣传口径写的"最多参考 10 张"
+// 与 API 不一致，以 API 为准）。handler 也会拦一道——那一道是给用户看的报错，
+// 这一道是**最后一道**：超出时宁可在发请求之前失败，也不要提交一个上游必定
+// 以 422 拒绝的请求，因为那时次数已经扣了。
+const maxFluxReferenceImages = 8
+
+// putReferenceImages 把参考图 URL 映射成上游的 input_image / input_image_2…
+//
+// 两个必须写对、写错了只会得到一个笼统 422 的地方：
+//
+//  1. **第一张的字段名是 `input_image`，没有 `_1`。** 循环写成 `input_image_%d`
+//     从 1 开始会得到 `input_image_1`，那是个上游不认识的字段——而多数网关对
+//     未知字段的处置是**静默忽略**，于是表现成"第一张参考图不起作用"，
+//     没有任何错误。
+//  2. **一张都没有时，一个 input_image* 键都不能加。** 塞 `"input_image": ""`
+//     会被上游按 uri 格式校验拒掉（实测错误是 `Does not match format 'uri'`），
+//     于是**所有纯文生图请求突然全挂**——而这个改动本来只该影响图生图。
+func putReferenceImages(body map[string]any, urls []string) error {
+	if len(urls) == 0 {
+		return nil
+	}
+	if len(urls) > maxFluxReferenceImages {
+		return fmt.Errorf("%w: 参考图 %d 张，上游最多接受 %d 张",
+			ErrUpstream, len(urls), maxFluxReferenceImages)
+	}
+	for i, u := range urls {
+		key := "input_image"
+		if i > 0 {
+			key = fmt.Sprintf("input_image_%d", i+1)
+		}
+		body[key] = u
+	}
+	return nil
+}
+
 func (a *FluxAdapter) Generate(ctx context.Context, req GenerateRequest) (GenerateResult, error) {
 	if req.UpstreamModel == "" {
 		// 我们自己的配置问题（image_models 行缺 upstream_model），但对用户表现为一次
@@ -128,6 +165,9 @@ func (a *FluxAdapter) Generate(ctx context.Context, req GenerateRequest) (Genera
 	// "每次都用同一个 seed"，用户会发现同样的 prompt 永远出同一张图。
 	if req.Seed != nil {
 		body["seed"] = *req.Seed
+	}
+	if err := putReferenceImages(body, req.ReferenceImageURLs); err != nil {
+		return GenerateResult{}, err
 	}
 
 	sub, err := a.submit(ctx, req.UpstreamModel, body)

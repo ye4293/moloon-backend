@@ -18,20 +18,7 @@ const (
 	// **不继承上游那 5 分钟**：上游花了 4 分 50 秒的话，共用 ctx 只剩 10 秒给
 	// 转存、必然降级——而这时候本来是可以再等一会儿的。
 	transferTimeout = 60 * time.Second
-	// maxImageBytes 下载上限。无上限地读进内存是内存耗尽向量：并发几十个请求
-	// 加上游返回一个巨大或永不结束的响应，就能把服务打死。
-	maxImageBytes = 20 << 20 // 20 MiB
 )
-
-// allowedImageTypes 白名单，值是落地用的扩展名。
-//
-// 白名单而非黑名单：这个字节流要挂到我们自己的域名下，能想到要拦什么的人总会
-// 漏掉一种，而漏掉的那种如果是 HTML，就是我们自己 origin 上的 XSS。
-var allowedImageTypes = map[string]string{
-	"image/png":  "png",
-	"image/jpeg": "jpg",
-	"image/webp": "webp",
-}
 
 // StoringAdapter 包住任意 Adapter，把上游返回的临时图片 URL 转存到我们自己的
 // 存储，换成永久 URL。
@@ -113,24 +100,17 @@ func (a *StoringAdapter) transfer(ctx context.Context, genID, srcURL string) (st
 	}
 
 	// 多读 1 字节：正好读满上限说明后面还有内容，即超限。
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxImageBytes+1))
+	// 判定交给 SniffImageType（它按 MaxImageBytes 报错），这里只负责不把无限的响应
+	// 体读进内存。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, storage.MaxImageBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("读取图片: %w", err)
 	}
-	if len(body) > maxImageBytes {
-		return "", fmt.Errorf("图片超过 %d 字节上限", maxImageBytes)
-	}
 
-	// **嗅探内容，不信上游的 Content-Type 头。** 这个字节流要挂到我们自己的域名
-	// 下，上游若返回 HTML（无论它把 Content-Type 写成什么），我们就在自己的
-	// origin 上托管了一个别人可控的 HTML 文件——那是 XSS。
-	ct := http.DetectContentType(body)
-	if i := strings.IndexByte(ct, ';'); i >= 0 {
-		ct = strings.TrimSpace(ct[:i])
-	}
-	ext, ok := allowedImageTypes[ct]
-	if !ok {
-		return "", fmt.Errorf("拒绝非图片内容：嗅探到 %q", ct)
+	// 嗅探内容、不信上游的 Content-Type 头，理由见 storage.SniffImageType 的注释。
+	ct, ext, err := storage.SniffImageType(body)
+	if err != nil {
+		return "", err
 	}
 
 	return a.store.Put(ctx, "g/"+genID+"."+ext, ct, body)
