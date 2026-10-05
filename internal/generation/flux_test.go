@@ -21,6 +21,66 @@ func newTestFluxAdapter(baseURL, apiKey string) *FluxAdapter {
 	return a
 }
 
+func TestFluxAcceptsNumericCosts(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		field string
+		want  float64
+	}{
+		{"integer", `"cost":7,`, 7},
+		{"gateway_float", `"cost":7.000000000000001,`, 7.000000000000001},
+		{"fractional_cent", `"cost":7.25,`, 7.25},
+		{"null", `"cost":null,`, 0},
+		{"omitted", "", 0},
+	} {
+		for _, async := range []bool{false, true} {
+			mode := "ready"
+			if async {
+				mode = "processing"
+			}
+			t.Run(tc.name+"/"+mode, func(t *testing.T) {
+				var submits, polls int
+				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Type", "application/json")
+					if r.Method == http.MethodPost {
+						submits++
+						if async {
+							_, _ = io.WriteString(w, `{`+tc.field+`"id":"task","status":"processing","polling_url":"https://api.bfl.ai/v1/get_result?id=task"}`)
+						} else {
+							_, _ = io.WriteString(w, `{`+tc.field+`"id":"task","status":"Ready","polling_url":"https://cdn.example/image.jpg"}`)
+						}
+						return
+					}
+					polls++
+					if r.URL.Path != "/flux/v1/get_result" || r.URL.Query().Get("id") != "task" {
+						t.Errorf("unexpected polling URL: %s", r.URL)
+					}
+					_, _ = io.WriteString(w, `{"id":"task","status":"Ready","result":{"sample":"https://cdn.example/image.jpg"}}`)
+				}))
+				defer srv.Close()
+				ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+				defer cancel()
+				res, err := newTestFluxAdapter(srv.URL, "test-key").Generate(ctx, GenerateRequest{
+					Prompt: "apple", Width: 1024, Height: 1024, UpstreamModel: "flux-2-max",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if res.UpstreamCost != tc.want || res.UpstreamID != "task" || res.ImageURL != "https://cdn.example/image.jpg" {
+					t.Fatalf("unexpected result: %+v", res)
+				}
+				wantPolls := 0
+				if async {
+					wantPolls = 1
+				}
+				if submits != 1 || polls != wantPolls {
+					t.Fatalf("submits=%d, polls=%d; want 1, %d", submits, polls, wantPolls)
+				}
+			})
+		}
+	}
+}
+
 func TestFluxSubmitReturnsImageFromPollingURL(t *testing.T) {
 	var gotPath, gotKey, gotAuth string
 	var gotBody map[string]any

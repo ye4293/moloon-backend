@@ -67,10 +67,10 @@ func NewFluxAdapter(baseURL, apiKey string) *FluxAdapter {
 }
 
 type fluxSubmitResponse struct {
-	ID         string `json:"id"`
-	Status     string `json:"status"`
-	PollingURL string `json:"polling_url"`
-	Cost       int    `json:"cost"`
+	ID         string  `json:"id"`
+	Status     string  `json:"status"`
+	PollingURL string  `json:"polling_url"`
+	Cost       float64 `json:"cost"` // 美分；网关可能返回小数，包括 7.000000000000001。
 }
 
 type fluxResultResponse struct {
@@ -225,7 +225,7 @@ func (a *FluxAdapter) submit(ctx context.Context, upstreamModel string, body map
 	if err := json.Unmarshal(payload, &out); err != nil {
 		// 原始响应体只进日志：它会经 handler 落进 generations.error 并直达用户浏览器，
 		// 而网关信封可能带着我们的账号、额度、内部主机名或 key 前缀。
-		log.Printf("[flux] 提交响应不是合法 JSON: %s", truncate(string(payload), 300))
+		log.Printf("[flux] 提交响应解析失败: %v，原始响应: %s", err, truncate(string(payload), 300))
 		return fluxSubmitResponse{}, fmt.Errorf("%w: 上游响应格式无法解析", ErrUpstream)
 	}
 	// 网关额度不足时会返回 **HTTP 200 加错误信封**（例如
@@ -266,7 +266,7 @@ func (a *FluxAdapter) getResult(ctx context.Context, id string) (string, error) 
 		}
 		var out fluxResultResponse
 		if err := json.Unmarshal(payload, &out); err != nil {
-			log.Printf("[flux] 兜底响应不是合法 JSON: %s", truncate(string(payload), 300))
+			log.Printf("[flux] 兜底响应解析失败: %v，原始响应: %s", err, truncate(string(payload), 300))
 			return "", fmt.Errorf("%w: 上游响应格式无法解析", ErrUpstream)
 		}
 		if strings.EqualFold(out.Status, fluxStatusReady) {

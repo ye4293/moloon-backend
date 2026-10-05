@@ -37,7 +37,7 @@ type Generation struct {
 	Stored bool `gorm:"not null;default:false"`
 	// UpstreamID 是上游返回的任务 id，出问题时凭它去上游对账。
 	UpstreamID   string    `gorm:"size:128"`
-	UpstreamCost int       `gorm:"not null;default:0"`
+	UpstreamCost float64   `gorm:"not null;default:0"` // 上游成本（美分，允许小数）
 	Error        string    `gorm:"type:text"`
 	IsPublic     bool      `gorm:"not null;default:false"`
 	DurationMs   int64     `gorm:"not null;default:0"`

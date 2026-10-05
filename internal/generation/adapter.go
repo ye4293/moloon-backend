@@ -71,8 +71,8 @@ type GenerateResult struct {
 	ImageURL string
 	// UpstreamID 上游任务 id，落库便于事后对账。
 	UpstreamID string
-	// UpstreamCost 上游报告的成本，与我们扣的次数是两回事，落库便于核算毛利。
-	UpstreamCost int
+	// UpstreamCost 上游报告的成本（美分，允许小数），与我们扣的次数是两回事。
+	UpstreamCost float64
 	// Stored ImageURL 是否已经指向我们自己的存储。
 	//
 	// false 表示它还是上游的临时链接，约一小时后失效。落到
