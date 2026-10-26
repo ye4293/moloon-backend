@@ -30,6 +30,7 @@ go run ./cmd/server                              # 启动服务，默认 :8080
 | POST | /api/v1/auth/login | 登录，返回 {token} |
 | GET | /api/v1/me | 当前用户（Bearer token），含 `credits.monthly/addon` |
 | GET | /api/v1/models | 启用的模型列表（公开），含 `credits` 字段 |
+| GET | /api/v1/gallery | 公开画廊，游标分页；仅返回已公开、成功且永久保存的图片 |
 | POST | /api/v1/generations | 同步生成一张图（Bearer token） |
 | POST | /api/v1/admin/credits | 管理员给指定邮箱发放次数（`role=admin`） |
 

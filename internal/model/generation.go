@@ -11,7 +11,7 @@ const (
 )
 
 type Generation struct {
-	ID string `gorm:"primaryKey;size:64"`
+	ID string `gorm:"primaryKey;size:64;index:idx_gen_gallery,priority:5,sort:desc"`
 	// UserID 与 CreatedAt 组成复合索引 idx_gen_user_created，专门服务历史查询
 	// （WHERE user_id = ? AND status <> 'processing' ORDER BY created_at DESC, id DESC）。
 	// 只留单列索引的话排序要落到额外的 sort。索引不覆盖 id DESC 这个次级排序键，
@@ -23,7 +23,7 @@ type Generation struct {
 	Width       int    `gorm:"not null"`
 	Height      int    `gorm:"not null"`
 	// Status 见上面三个常量。索引是给启动扫描用的——它要按 status 找卡住的行。
-	Status       string `gorm:"index;size:16;not null"`
+	Status       string `gorm:"index;index:idx_gen_gallery,priority:2;size:16;not null"`
 	ImageURL     string `gorm:"type:text"`
 	CreditsSpent int    `gorm:"not null;default:0"`
 	// Stored 图片是否已转存到我们自己的存储。
@@ -34,15 +34,16 @@ type Generation struct {
 	//
 	// **不配套加 storage_key 列**：key 从 ID 确定性推导（g/<id>.<ext>），再存
 	// 一份就是两份可能不一致的真相。
-	Stored bool `gorm:"not null;default:false"`
+	Stored bool `gorm:"not null;default:false;index:idx_gen_gallery,priority:3"`
 	// UpstreamID 是上游返回的任务 id，出问题时凭它去上游对账。
-	UpstreamID   string    `gorm:"size:128"`
-	UpstreamCost float64   `gorm:"not null;default:0"` // 上游成本（美分，允许小数）
-	Error        string    `gorm:"type:text"`
-	IsPublic     bool      `gorm:"not null;default:false"`
-	DurationMs   int64     `gorm:"not null;default:0"`
-	CreatedAt    time.Time `gorm:"index:idx_gen_user_created,priority:2"`
-	UpdatedAt    time.Time
+	UpstreamID   string  `gorm:"size:128"`
+	UpstreamCost float64 `gorm:"not null;default:0"` // 上游成本（美分，允许小数）
+	Error        string  `gorm:"type:text"`
+	// idx_gen_gallery 覆盖公开画廊的等值筛选与倒序分页，不让首页请求扫描整张表。
+	IsPublic   bool      `gorm:"not null;default:false;index:idx_gen_gallery,priority:1"`
+	DurationMs int64     `gorm:"not null;default:0"`
+	CreatedAt  time.Time `gorm:"index:idx_gen_user_created,priority:2;index:idx_gen_gallery,priority:4,sort:desc"`
+	UpdatedAt  time.Time
 
 	// ReferenceKeys 这次生成用到的参考图（图生图 / 编辑的输入），JSON 数组字符串。
 	// 空串表示纯文生图。

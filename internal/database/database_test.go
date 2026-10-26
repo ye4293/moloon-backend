@@ -168,6 +168,9 @@ func TestGenerationHasStoredColumnAndCompositeIndex(t *testing.T) {
 	if !m.HasIndex(&model.Generation{}, "idx_gen_user_created") {
 		t.Error("generations 缺 (user_id, created_at) 复合索引")
 	}
+	if !m.HasIndex(&model.Generation{}, "idx_gen_gallery") {
+		t.Error("generations 缺公开画廊复合索引")
+	}
 }
 
 // TestOpenDropsStaleUserIDIndex 钉住"旧的单列索引会被清理掉"。

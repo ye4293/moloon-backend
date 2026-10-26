@@ -196,6 +196,7 @@ func newRouterFull(
 	// 公开：定价页在未登录时就要能看到档位。
 	plansHandler := &handler.PlansHandler{DB: db}
 	api.GET("/plans", plansHandler.List)
+	api.GET("/gallery", (&handler.GalleryHandler{DB: db}).List)
 
 	// billing.New 在没有 STRIPE_SECRET_KEY 时返回 nil，handler 据此回 503。
 	billingClient := billing.New(cfg.StripeSecretKey, appBaseURL)
